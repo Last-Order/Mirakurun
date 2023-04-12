@@ -14,6 +14,7 @@
    limitations under the License.
 */
 import { Writable } from "stream";
+import { shuffle } from "lodash";
 import * as common from "./common";
 import * as log from "./log";
 import * as db from "./db";
@@ -415,6 +416,6 @@ export default class Tuner {
             }
         }
 
-        return devices;
+        return shuffle(devices);
     }
 }
