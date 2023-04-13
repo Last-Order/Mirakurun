@@ -273,12 +273,21 @@ export default class TunerDevice extends EventEmitter {
             cmd = cmd.replace("<satellite>", ch.satellite);
         }
 
-        // tslint:disable-next-line:prefer-conditional-expression
-        if (ch.space) {
-            cmd = cmd.replace("<space>", ch.space.toString(10));
-        } else {
-            cmd = cmd.replace("<space>", "0"); // set default value to '0'
-        }
+        const space: string = (() => {
+            if (this._config.spaceMap?.[ch.type] !== undefined) {
+                const specifiedSpace = this._config.spaceMap[ch.type].toString(10);
+                log.debug("space specified by spaceMap, tuner: %s, channel type: %s, space: %s", this._config.name, ch.type, specifiedSpace);
+                return specifiedSpace;
+            }
+            if (ch.space !== undefined) {
+                log.debug("space specified by ch.space, tuner: %s, channel type: %s, space: %s", this._config.name, ch.type, ch.space.toString(10));
+                return ch.space.toString(10);
+            }
+            log.debug("space not specified, tuner: %s, channel type: %s, space: 0", this._config.name, ch.type);
+            return "0";
+        })();
+
+        cmd = cmd.replace("<space>", space);
 
         if (ch.freq !== undefined) {
             cmd = cmd.replace("<freq>", ch.freq.toString(10));

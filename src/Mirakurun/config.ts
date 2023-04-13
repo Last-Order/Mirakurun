@@ -97,6 +97,9 @@ export interface Tuner {
     readonly decoder?: string;
 
     readonly isDisabled?: boolean;
+
+    /** allows specify different space for different tuners */
+    readonly spaceMap?: Record<common.ChannelType, number>;
 }
 
 export interface Channel {
