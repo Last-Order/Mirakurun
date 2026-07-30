@@ -21,6 +21,7 @@ import status from "./status";
 interface StreamOptions extends stream.TransformOptions {
     readonly output: stream.Writable;
     readonly command: string;
+    readonly requestId?: string;
 }
 
 let idCounter = 0;
@@ -32,6 +33,7 @@ export default class TSDecoder extends stream.Writable {
 
     private _id: number;
     private _command: string;
+    private _requestId: string;
     private _process: child_process.ChildProcess;
     private _readable: stream.Readable;
     private _writable: stream.Writable;
@@ -40,12 +42,16 @@ export default class TSDecoder extends stream.Writable {
     private _timeout: NodeJS.Timeout;
     private _closed: boolean = false;
     private _deadCount: number = 0;
+    private _createdAt = Date.now();
+    private _inputBytes = 0;
+    private _outputBytes = 0;
 
     constructor(opts: StreamOptions) {
         super();
 
         this._id = idCounter++;
         this._command = opts.command;
+        this._requestId = opts.requestId || "-";
 
         this._output = opts.output;
         this._output.once("finish", this._close.bind(this));
@@ -60,7 +66,7 @@ export default class TSDecoder extends stream.Writable {
 
         this.once("close", this._close.bind(this));
 
-        log.info("TSDecoder#%d has created (command=%s)", this._id, this._command);
+        log.info("TSDecoder#%d has created for request `%s` (command=%s)", this._id, this._requestId, this._command);
 
         ++status.streamCount.decoder;
 
@@ -68,6 +74,8 @@ export default class TSDecoder extends stream.Writable {
     }
 
     _write(chunk: Buffer, encoding: string, callback: Function) {
+
+        this._inputBytes += chunk.length;
 
         if (!this._writable) {
             callback();
@@ -77,7 +85,10 @@ export default class TSDecoder extends stream.Writable {
         if (this._isNew === true && this._process) {
             this._isNew = false;
             this._timeout = setTimeout(() => {
-                log.warn("TSDecoder#%d process will force killed because no respond...", this._id);
+                log.warn(
+                    "TSDecoder#%d for request `%s` will be force killed because no output was received after %dms (inputBytes=%d)",
+                    this._id, this._requestId, Date.now() - this._createdAt, this._inputBytes
+                );
                 this._dead();
             }, 1500);
         }
@@ -112,7 +123,7 @@ export default class TSDecoder extends stream.Writable {
 
         proc.stderr.pipe(process.stderr);
         proc.stdout.once("data", () => clearTimeout(this._timeout));
-        proc.stdout.on("data", chunk => this._output.write(chunk));
+        proc.stdout.on("data", chunk => this._writeOutput(chunk));
 
         this._readable = proc.stdout;
         this._writable = proc.stdin;
@@ -145,12 +156,26 @@ export default class TSDecoder extends stream.Writable {
 
         const passThrough = new stream.PassThrough({ allowHalfOpen: false });
 
-        passThrough.on("data", chunk => this._output.write(chunk));
+        passThrough.on("data", chunk => this._writeOutput(chunk));
 
         this._readable = passThrough;
         this._writable = passThrough;
 
         log.warn("TSDecoder#%d has been fallback into pass-through stream", this._id);
+    }
+
+    private _writeOutput(chunk: Buffer): void {
+
+        this._output.write(chunk);
+        this._outputBytes += chunk.length;
+
+        if (this._outputBytes === chunk.length) {
+            log.info(
+                "TSDecoder#%d first output for request `%s` after %dms (bytes=%d, inputBytes=%d, pid=%s)",
+                this._id, this._requestId, Date.now() - this._createdAt, chunk.length, this._inputBytes,
+                this._process ? this._process.pid : "pass-through"
+            );
+        }
     }
 
     private _kill(): void {
@@ -188,7 +213,11 @@ export default class TSDecoder extends stream.Writable {
 
         --status.streamCount.decoder;
 
-        log.info("TSDecoder#%d has closed (command=%s)", this._id, this._command);
+        log.info(
+            "TSDecoder#%d has closed for request `%s` after %dms (inputBytes=%d, outputBytes=%d, command=%s)",
+            this._id, this._requestId, Date.now() - this._createdAt,
+            this._inputBytes, this._outputBytes, this._command
+        );
 
         // close
         this.emit("close");

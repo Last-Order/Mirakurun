@@ -60,6 +60,9 @@ export default class TunerDevice extends EventEmitter {
     private _fatalCount = 0;
     private _exited = false;
     private _closing = false;
+    private _spawnedAt = 0;
+    private _receivedBytes = 0;
+    private _noDataTimer: NodeJS.Timeout;
 
     constructor(private _index: number, private _config: config.Tuner) {
         super();
@@ -161,7 +164,11 @@ export default class TunerDevice extends EventEmitter {
 
     async startStream(user: User, stream: TSFilter, channel?: ChannelItem): Promise<void> {
 
-        log.debug("TunerDevice#%d start stream for user `%s` (priority=%d)...", this._index, user.id, user.priority);
+        log.debug(
+            "TunerDevice#%d start stream for user `%s` (priority=%d, pid=%s, channel=%s, users=%d)...",
+            this._index, user.id, user.priority, this.pid,
+            this._channel ? `${this._channel.type}/${this._channel.channel}` : "-", this._users.size
+        );
 
         if (this._isAvailable === false) {
             throw new Error(util.format("TunerDevice#%d is not available", this._index));
@@ -182,6 +189,11 @@ export default class TunerDevice extends EventEmitter {
                         throw new Error(util.format("TunerDevice#%d has higher priority user", this._index));
                     }
 
+                    log.info(
+                        "TunerDevice#%d switching channel for request `%s` from %s/%s to %s/%s (pid=%d, users=%d)",
+                        this._index, user.id, this._channel.type, this._channel.channel,
+                        channel.type, channel.channel, this.pid, this._users.size
+                    );
                     await this._kill(true);
                     this._spawn(channel);
                 }
@@ -300,6 +312,8 @@ export default class TunerDevice extends EventEmitter {
         this._process = child_process.spawn(cmd.split(" ")[0], cmd.split(" ").slice(1));
         this._command = cmd;
         this._channel = ch;
+        this._spawnedAt = Date.now();
+        this._receivedBytes = 0;
 
         if (this._config.dvbDevicePath) {
             const cat = child_process.spawn("cat", [this._config.dvbDevicePath]);
@@ -364,12 +378,31 @@ export default class TunerDevice extends EventEmitter {
 
         // flowing start
         this._stream.on("data", this._streamOnData.bind(this));
+        this._noDataTimer = setTimeout(() => {
+            if (this._process && this._receivedBytes === 0) {
+                log.warn(
+                    "TunerDevice#%d has received no data %dms after spawn (pid=%d, channel=%s/%s, users=%d, command=%s)",
+                    this._index, Date.now() - this._spawnedAt, this._process.pid,
+                    this._channel.type, this._channel.channel, this._users.size, this._command
+                );
+            }
+        }, 5000);
 
         this._updated();
         log.info("TunerDevice#%d process has spawned by command `%s` (pid=%d)", this._index, cmd, this._process.pid);
     }
 
     private _streamOnData(chunk: Buffer): void {
+
+        this._receivedBytes += chunk.length;
+        if (this._receivedBytes === chunk.length) {
+            clearTimeout(this._noDataTimer);
+            log.info(
+                "TunerDevice#%d received first data after %dms (pid=%d, bytes=%d, channel=%s/%s, users=%d)",
+                this._index, Date.now() - this._spawnedAt, this.pid, chunk.length,
+                this._channel.type, this._channel.channel, this._users.size
+            );
+        }
 
         for (const user of this._users) {
             user._stream.write(chunk);
@@ -379,6 +412,7 @@ export default class TunerDevice extends EventEmitter {
     private _end(): void {
 
         this._isAvailable = false;
+        clearTimeout(this._noDataTimer);
 
         this._stream.removeAllListeners("data");
 
@@ -406,6 +440,23 @@ export default class TunerDevice extends EventEmitter {
         this._isAvailable = false;
         this._closing = close;
 
+        const startedAt = Date.now();
+        const pid = this._process.pid;
+        const slowTimer = setTimeout(() => {
+            log.warn(
+                "TunerDevice#%d process release is still pending after %dms (pid=%d, close=%s, channel=%s, users=%d)",
+                this._index, Date.now() - startedAt, pid, close,
+                this._channel ? `${this._channel.type}/${this._channel.channel}` : "-", this._users.size
+            );
+        }, 5000);
+
+        log.info(
+            "TunerDevice#%d stopping process (pid=%d, close=%s, channel=%s, users=%d, receivedBytes=%d)",
+            this._index, pid, close,
+            this._channel ? `${this._channel.type}/${this._channel.channel}` : "-",
+            this._users.size, this._receivedBytes
+        );
+
         this._updated();
 
         await new Promise<void>(resolve => {
@@ -430,9 +481,17 @@ export default class TunerDevice extends EventEmitter {
                 this._process.kill("SIGTERM");
             }
         });
+
+        clearTimeout(slowTimer);
+        log.info(
+            "TunerDevice#%d process released after %dms (pid=%d, close=%s)",
+            this._index, Date.now() - startedAt, pid, close
+        );
     }
 
     private _release(): void {
+
+        clearTimeout(this._noDataTimer);
 
         if (this._process) {
             this._process.stderr.removeAllListeners();

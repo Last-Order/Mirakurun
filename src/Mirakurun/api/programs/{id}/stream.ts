@@ -15,6 +15,7 @@
 */
 import { Operation } from "express-openapi";
 import * as api from "../../../api";
+import * as log from "../../../log";
 import _ from "../../../_";
 
 export const parameters = [
@@ -50,23 +51,50 @@ export const get: Operation = (req, res) => {
         return;
     }
 
-    let requestAborted = false;
-    req.once("close", () => requestAborted = true);
-
     (<any> res.socket)._writableState.highWaterMark = Math.max(res.writableHighWaterMark, 1024 * 1024 * 16);
     res.socket.setNoDelay(true);
 
     const userId = (req.ip || "unix") + ":" + (req.socket.remotePort || Date.now());
+    const startedAt = Date.now();
+    const priority = parseInt(req.get("X-Mirakurun-Priority"), 10) || 0;
+    const disableDecoder = (<number> <any> req.query.decode === 0);
+    let requestAborted = false;
+    let phase = "initializing stream";
+
+    const pendingTimer = setTimeout(() => {
+        if (res.headersSent === false) {
+            log.warn(
+                "Program stream HTTP request `%s` has not started responding after %dms (phase=%s, programId=%s, aborted=%s)",
+                userId, Date.now() - startedAt, phase, program.id, req.aborted
+            );
+        }
+    }, 5000);
+
+    req.once("close", () => {
+        requestAborted = true;
+        clearTimeout(pendingTimer);
+        log.info(
+            "Program stream HTTP request `%s` closed after %dms (phase=%s, programId=%s, headersSent=%s, aborted=%s)",
+            userId, Date.now() - startedAt, phase, program.id, res.headersSent, req.aborted
+        );
+    });
+
+    log.info(
+        "Program stream HTTP request `%s` received (programId=%s, networkId=%s, serviceId=%s, eventId=%s, priority=%d, decode=%s, agent=%s)",
+        userId, program.id, program.networkId, program.serviceId, program.eventId,
+        priority, !disableDecoder, req.get("User-Agent") || "-"
+    );
 
     _.tuner.initProgramStream(program, {
         id: userId,
-        priority: parseInt(req.get("X-Mirakurun-Priority"), 10) || 0,
+        priority,
         agent: req.get("User-Agent"),
         url: req.url,
-        disableDecoder: (<number> <any> req.query.decode === 0)
+        disableDecoder
     }, res)
         .then(tsFilter => {
             if (requestAborted === true || req.aborted === true) {
+                phase = "closed before initialization completed";
                 return tsFilter.close();
             }
 
@@ -75,10 +103,24 @@ export const get: Operation = (req, res) => {
             res.setHeader("Content-Type", "video/MP2T");
             res.setHeader("X-Mirakurun-Tuner-User-ID", userId);
             res.status(200);
+            phase = "waiting for first response bytes";
+
+            log.info(
+                "Program stream HTTP request `%s` initialized after %dms (programId=%s, headersSent=%s)",
+                userId, Date.now() - startedAt, program.id, res.headersSent
+            );
 
             req.setTimeout(1000 * 60 * 10); // 10 minites
         })
-        .catch((err) => api.responseStreamErrorHandler(res, err));
+        .catch((err) => {
+            phase = "initialization failed";
+            clearTimeout(pendingTimer);
+            log.warn(
+                "Program stream HTTP request `%s` failed after %dms (programId=%s, error=%s)",
+                userId, Date.now() - startedAt, program.id, err && err.message ? err.message : err
+            );
+            api.responseStreamErrorHandler(res, err);
+        });
 };
 
 get.apiDoc = {

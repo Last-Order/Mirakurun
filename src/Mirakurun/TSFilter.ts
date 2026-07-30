@@ -27,6 +27,7 @@ import ServiceItem from "./ServiceItem";
 
 interface TSFilterOptions {
     readonly output?: Writable;
+    readonly requestId?: string;
 
     readonly networkId?: number;
     readonly serviceId?: number;
@@ -91,6 +92,10 @@ export default class TSFilter extends EventEmitter {
 
     // output
     private _output: Writable;
+    private _requestId: string;
+    private _createdAt = Date.now();
+    private _inputBytes = 0;
+    private _outputBytes = 0;
 
     // options
     private _provideServiceId: number;
@@ -151,6 +156,8 @@ export default class TSFilter extends EventEmitter {
 
     constructor(options: TSFilterOptions) {
         super();
+
+        this._requestId = options.requestId || "-";
 
         const enabletsmf = options.tsmfRelTs || 0;
         if (enabletsmf !== 0) {
@@ -225,10 +232,16 @@ export default class TSFilter extends EventEmitter {
         this.once("end", this._close.bind(this));
         this.once("close", this._close.bind(this));
 
-        log.info("TSFilter: created (serviceId=%d, eventId=%d)", this._provideServiceId, this._provideEventId);
+        log.info(
+            "TSFilter: created for request `%s` (serviceId=%d, eventId=%d)",
+            this._requestId, this._provideServiceId, this._provideEventId
+        );
 
         if (this._ready === false) {
-            log.info("TSFilter: waiting for serviceId=%d, eventId=%d", this._provideServiceId, this._provideEventId);
+            log.info(
+                "TSFilter: request `%s` is waiting for serviceId=%d, eventId=%d",
+                this._requestId, this._provideServiceId, this._provideEventId
+            );
         }
 
         ++status.streamCount.tsFilter;
@@ -243,6 +256,8 @@ export default class TSFilter extends EventEmitter {
         if (this._closed) {
             throw new Error("TSFilter has closed already");
         }
+
+        this._inputBytes += chunk.length;
 
         let offset = 0;
         const length = chunk.length;
@@ -284,7 +299,16 @@ export default class TSFilter extends EventEmitter {
 
         if (this._buffer.length !== 0) {
             if (this._ready && this._output.writableLength < this._output.writableHighWaterMark) {
-                this._output.write(Buffer.concat(this._buffer));
+                const output = Buffer.concat(this._buffer);
+                this._output.write(output);
+                this._outputBytes += output.length;
+                if (this._outputBytes === output.length) {
+                    log.info(
+                        "TSFilter: first output for request `%s` after %dms (bytes=%d, inputBytes=%d, serviceId=%s, eventId=%s)",
+                        this._requestId, Date.now() - this._createdAt, output.length, this._inputBytes,
+                        this._provideServiceId, this._provideEventId
+                    );
+                }
                 this._buffer.length = 0;
             } else {
                 const head = this._buffer.length - (this._maxBufferBytesBeforeReady / PACKET_SIZE);
@@ -1079,6 +1103,7 @@ export default class TSFilter extends EventEmitter {
         }
 
         // clear output stream
+        const hadOutput = !!this._output;
         if (this._output) {
             if (this._output.writableEnded === false) {
                 this._output.end();
@@ -1092,7 +1117,19 @@ export default class TSFilter extends EventEmitter {
 
         --status.streamCount.tsFilter;
 
-        log.info("TSFilter#_close: closed (serviceId=%s, eventId=%s)", this._provideServiceId, this._provideEventId);
+        const lifetime = Date.now() - this._createdAt;
+        if (hadOutput && this._outputBytes === 0) {
+            log.warn(
+                "TSFilter#_close: request `%s` closed without output after %dms (inputBytes=%d, serviceId=%s, eventId=%s)",
+                this._requestId, lifetime, this._inputBytes, this._provideServiceId, this._provideEventId
+            );
+        } else {
+            log.info(
+                "TSFilter#_close: request `%s` closed after %dms (inputBytes=%d, outputBytes=%d, serviceId=%s, eventId=%s)",
+                this._requestId, lifetime, this._inputBytes, this._outputBytes,
+                this._provideServiceId, this._provideEventId
+            );
+        }
 
         // close
         this.emit("close");

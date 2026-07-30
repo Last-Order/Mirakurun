@@ -280,12 +280,49 @@ export default class Tuner {
         return new Promise<TSFilter>((resolve, reject) => {
 
             const setting = user.streamSetting;
+            const startedAt = Date.now();
+            let phase = "selecting tuner";
 
             if (_.config.server.disableEITParsing === true) {
                 setting.parseEIT = false;
             }
 
             const devices = this._getDevicesByType(setting.channel.type);
+            const describeDevices = () => JSON.stringify(devices.map(device => ({
+                index: device.index,
+                pid: device.pid,
+                channel: device.channel ? `${device.channel.type}/${device.channel.channel}` : null,
+                isAvailable: device.isAvailable,
+                isFree: device.isFree,
+                isUsing: device.isUsing,
+                isFault: device.isFault,
+                priority: device.getPriority(),
+                users: device.users.map(deviceUser => deviceUser.id)
+            })));
+            const slowTimer = setTimeout(() => {
+                log.warn(
+                    "Tuner stream request `%s` is still pending after %dms (phase=%s, devices=%s)",
+                    user.id, Date.now() - startedAt, phase, describeDevices()
+                );
+            }, 5000);
+            const resolveRequest = (tsFilter: TSFilter) => {
+                clearTimeout(slowTimer);
+                resolve(tsFilter);
+            };
+            const rejectRequest = (err: Error) => {
+                clearTimeout(slowTimer);
+                log.warn(
+                    "Tuner stream request `%s` failed after %dms (phase=%s, error=%s, devices=%s)",
+                    user.id, Date.now() - startedAt, phase, err && err.message ? err.message : err, describeDevices()
+                );
+                reject(err);
+            };
+
+            log.info(
+                "Tuner stream request `%s` started (url=%s, channel=%s/%s, serviceId=%s, eventId=%s, priority=%d, candidates=%d)",
+                user.id, user.url || "-", setting.channel.type, setting.channel.channel,
+                setting.serviceId, setting.eventId, user.priority, devices.length
+            );
 
             let tryCount = 50;
             const length = devices.length;
@@ -293,11 +330,13 @@ export default class Tuner {
             function find() {
 
                 let device: TunerDevice = null;
+                let selectionReason: string = null;
 
                 // 1. join to existing
                 for (let i = 0; i < length; i++) {
                     if (devices[i].isAvailable === true && devices[i].channel === setting.channel) {
                         device = devices[i];
+                        selectionReason = "join-existing";
                         break;
                     }
                 }
@@ -307,6 +346,7 @@ export default class Tuner {
                     const remoteDevice = devices.find(device => device.isRemote);
                     if (remoteDevice) {
                         if (setting.networkId !== undefined && setting.parseEIT === true) {
+                            phase = `fetching remote programs on tuner #${remoteDevice.index}`;
                             remoteDevice.getRemotePrograms({ networkId: setting.networkId })
                                 .then(async programs => {
                                     await common.sleep(1000);
@@ -316,8 +356,8 @@ export default class Tuner {
                                     }
                                     await common.sleep(1000);
                                 })
-                                .then(() => resolve(null))
-                                .catch(err => reject(err));
+                                .then(() => resolveRequest(null))
+                                .catch(err => rejectRequest(err));
 
                             return;
                         }
@@ -329,6 +369,7 @@ export default class Tuner {
                     for (let i = 0; i < length; i++) {
                         if (devices[i].isFree === true) {
                             device = devices[i];
+                            selectionReason = "free";
                             break;
                         }
                     }
@@ -339,6 +380,7 @@ export default class Tuner {
                     for (let i = 0; i < length; i++) {
                         if (devices[i].isAvailable === true && devices[i].users.length === 0) {
                             device = devices[i];
+                            selectionReason = "replace-idle";
                             break;
                         }
                     }
@@ -353,6 +395,7 @@ export default class Tuner {
                     for (let i = 0; i < length; i++) {
                         if (devices[i].isUsing === true && devices[i].getPriority() < user.priority) {
                             device = devices[i];
+                            selectionReason = "priority-takeover";
                             break;
                         }
                     }
@@ -363,21 +406,30 @@ export default class Tuner {
                     if (tryCount > 0) {
                         setTimeout(find, 250);
                     } else {
-                        reject(new Error("no available tuners"));
+                        rejectRequest(new Error("no available tuners"));
                     }
                 } else {
+                    phase = `starting stream on tuner #${device.index}`;
+                    log.info(
+                        "Tuner stream request `%s` selected TunerDevice#%d after %dms (reason=%s, pid=%s, channel=%s)",
+                        user.id, device.index, Date.now() - startedAt, selectionReason, device.pid,
+                        device.channel ? `${device.channel.type}/${device.channel.channel}` : "-"
+                    );
+
                     let output: Writable;
                     if (user.disableDecoder === true || device.decoder === null) {
                         output = dest;
                     } else {
                         output = new TSDecoder({
                             output: dest,
-                            command: device.decoder
+                            command: device.decoder,
+                            requestId: user.id
                         });
                     }
 
                     const tsFilter = new TSFilter({
                         output,
+                        requestId: user.id,
                         networkId: setting.networkId,
                         serviceId: setting.serviceId,
                         eventId: setting.eventId,
@@ -393,11 +445,16 @@ export default class Tuner {
 
                     device.startStream(user, tsFilter, setting.channel)
                         .then(() => {
-                            resolve(tsFilter);
+                            phase = "stream initialized";
+                            log.info(
+                                "Tuner stream request `%s` initialized on TunerDevice#%d after %dms",
+                                user.id, device.index, Date.now() - startedAt
+                            );
+                            resolveRequest(tsFilter);
                         })
                         .catch((err) => {
                             tsFilter.end();
-                            reject(err);
+                            rejectRequest(err);
                         });
                 }
             }
