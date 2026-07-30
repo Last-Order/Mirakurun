@@ -63,6 +63,8 @@ export default class TunerDevice extends EventEmitter {
     private _spawnedAt = 0;
     private _receivedBytes = 0;
     private _noDataTimer: NodeJS.Timeout;
+    private _startupFailureRecorded = false;
+    private _consecutiveStartupFailureCount = 0;
 
     constructor(private _index: number, private _config: config.Tuner) {
         super();
@@ -314,6 +316,7 @@ export default class TunerDevice extends EventEmitter {
         this._channel = ch;
         this._spawnedAt = Date.now();
         this._receivedBytes = 0;
+        this._startupFailureRecorded = false;
 
         if (this._config.dvbDevicePath) {
             const cat = child_process.spawn("cat", [this._config.dvbDevicePath]);
@@ -378,15 +381,12 @@ export default class TunerDevice extends EventEmitter {
 
         // flowing start
         this._stream.on("data", this._streamOnData.bind(this));
+        const noDataTimeout = 5000;
         this._noDataTimer = setTimeout(() => {
-            if (this._process && this._receivedBytes === 0) {
-                log.warn(
-                    "TunerDevice#%d has received no data %dms after spawn (pid=%d, channel=%s/%s, users=%d, command=%s)",
-                    this._index, Date.now() - this._spawnedAt, this._process.pid,
-                    this._channel.type, this._channel.channel, this._users.size, this._command
-                );
+            if (this._process && this._receivedBytes === 0 && this._closing === false) {
+                this._recordStartupFailure(`no data received within ${noDataTimeout}ms`);
             }
-        }, 5000);
+        }, noDataTimeout);
 
         this._updated();
         log.info("TunerDevice#%d process has spawned by command `%s` (pid=%d)", this._index, cmd, this._process.pid);
@@ -397,6 +397,14 @@ export default class TunerDevice extends EventEmitter {
         this._receivedBytes += chunk.length;
         if (this._receivedBytes === chunk.length) {
             clearTimeout(this._noDataTimer);
+            if (this._consecutiveStartupFailureCount !== 0) {
+                log.info(
+                    "TunerDevice#%d recovered after %d consecutive startup failure(s) (pid=%d, elapsedMs=%d, channel=%s/%s)",
+                    this._index, this._consecutiveStartupFailureCount, this.pid,
+                    Date.now() - this._spawnedAt, this._channel.type, this._channel.channel
+                );
+                this._consecutiveStartupFailureCount = 0;
+            }
             log.info(
                 "TunerDevice#%d received first data after %dms (pid=%d, bytes=%d, channel=%s/%s, users=%d)",
                 this._index, Date.now() - this._spawnedAt, this.pid, chunk.length,
@@ -411,6 +419,10 @@ export default class TunerDevice extends EventEmitter {
 
     private _end(): void {
 
+        if (this._closing === false && this._receivedBytes === 0) {
+            this._recordStartupFailure("process ended before first data");
+        }
+
         this._isAvailable = false;
         clearTimeout(this._noDataTimer);
 
@@ -424,6 +436,23 @@ export default class TunerDevice extends EventEmitter {
         }
 
         this._updated();
+    }
+
+    private _recordStartupFailure(reason: string): void {
+
+        if (this._startupFailureRecorded === true || this._receivedBytes !== 0) {
+            return;
+        }
+
+        this._startupFailureRecorded = true;
+        ++this._consecutiveStartupFailureCount;
+
+        log.warn(
+            "TunerDevice#%d startup failure recorded (consecutiveFailures=%d, reason=%s, elapsedMs=%d, pid=%s, channel=%s, users=%d, command=%s)",
+            this._index, this._consecutiveStartupFailureCount, reason, Date.now() - this._spawnedAt,
+            this.pid, this._channel ? `${this._channel.type}/${this._channel.channel}` : "-",
+            this._users.size, this._command || "-"
+        );
     }
 
     private async _kill(close: boolean): Promise<void> {
