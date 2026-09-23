@@ -45,7 +45,60 @@ MIRAKURUN_LOG_RETENTION_DAYS=7
 这些参数不是 `server.yml` 配置；`logLevel`、内存日志的 `maxLogHistory` 保持原含义。
 不要让外部轮转工具同时操作新日志目录。
 
-## 已有服务迁移（无需重装服务）
+## Git 拉取部署：直接更新并重启（常规方式）
+
+如果服务直接运行 Git 仓库中的代码，照常 `git pull` 后重启即可，
+**无需运行迁移脚本，无需重新安装服务，也无需修改 winser 配置**。
+本次日志功能不需要额外编译或安装新依赖；其他代码更新仍按其自身的构建要求处理。
+重启会短暂停服，请安排在没有录制任务时进行。
+
+在管理员 PowerShell 中进入服务实际使用的仓库目录（替换示例路径和服务名）：
+
+```powershell
+Set-Location 'D:\Git\Mirakurun'
+git status --short
+git rev-parse HEAD # 记录更新前的提交，便于回滚
+git pull --ff-only
+if ($LASTEXITCODE -ne 0) { throw 'git pull 失败，请处理后再重启服务。' }
+Restart-Service -Name mirakurun
+```
+
+如有本地修改，更新前先保存并处理，避免覆盖。`--ff-only` 在无法快进时停止，
+不自动生成合并提交。更新后按下方“验证服务与日志”检查。
+
+如果没有生成日期日志，或旧日志仍持续记录普通业务输出，检查服务启动配置：
+
+```powershell
+$parameters = Get-ItemProperty -LiteralPath 'HKLM:\SYSTEM\CurrentControlSet\Services\mirakurun\Parameters'
+$parameters | Select-Object Application, AppDirectory, AppParameters, AppStdout, AppStderr, AppEnvironmentExtra
+```
+
+确认 `AppDirectory` 指向刚才更新的仓库，启动入口为 `bin\init.win32.js`，
+服务环境包含 `USING_WINSER=1`。直接运行 `lib/server.js` 不会加载本功能。
+日志目录使用服务保存的 `LOCALAPPDATA`，未必是当前管理员账户的目录。
+
+### Git 部署回滚
+
+如需仅撤回本次日志功能，可在停止服务后，从记录的更新前提交恢复 Windows 入口。
+先保存当前入口中的本地修改，再执行（替换提交占位符）：
+
+```powershell
+Stop-Service -Name mirakurun
+$previousCommit = '替换为更新前提交SHA'
+git restore --source=$previousCommit -- bin/init.win32.js
+if ($LASTEXITCODE -ne 0) { throw '恢复入口失败，请检查后再启动服务。' }
+Start-Service -Name mirakurun
+```
+
+这会留下一个本地文件修改；下次更新前需处理该修改。新增的 `daily-logs.js` 可以保留，
+旧入口不会加载它。旧入口恢复后日志回到原 `stdout` / `stderr`，已有日期日志保留。
+此操作只回滚日志入口，不回滚其他业务改动。恢复后同样执行下方验证。
+
+## 独立源码目录迁移（可选，无需重装服务）
+
+本节仅适用于新源码目录与服务安装目录分开的部署。
+**服务直接运行 Git 仓库时，使用上一节的更新步骤，跳过本节。**
+迁移脚本会拒绝在服务安装目录中直接运行，避免将已更新文件误当作旧版本备份。
 
 迁移会短暂停止 Mirakurun，安排在没有录制任务时进行。
 本次日志功能仅依赖两个 JavaScript 文件，不需要编译，也不需要安装新的 npm 依赖。
@@ -75,7 +128,13 @@ MIRAKURUN_LOG_RETENTION_DAYS=7
    保存输出中的安装目录和备份目录。脚本不改注册表、服务账户、配置、数据库或旧日志。
    原来停止的服务会保持停止，需要手动 `Start-Service mirakurun`。
    若执行策略阻止脚本，按本机管理策略批准脚本，或手动完成上述备份、停止、复制、启动步骤。
-4. 验证服务和日志（把示例目录替换为第 2 步确认的服务用户目录或自定义目录）：
+4. 按下一节验证服务与日志。
+
+迁移失败时脚本会报告备份目录，可能留下已停止的服务或部分更新的文件；按“独立目录迁移回滚”恢复。
+
+## 验证服务与日志（两种更新方式通用）
+
+把示例目录替换为服务配置中用户的目录或自定义目录：
 
    ```powershell
    Get-Service mirakurun
@@ -89,13 +148,12 @@ MIRAKURUN_LOG_RETENTION_DAYS=7
    自定义端口时修改 URL。服务显示 Running 不代表应用已成功就绪，必须同时确认 HTTP 响应
    和日志。`stderr` 当天没有输出时可能不存在，属于正常现象。还应检查原 `stderr`
    是否出现启动/写入故障；正常运行时旧 `stdout`、`stderr` 不应随普通业务日志增长。
-5. 次日确认新的日期文件；第 8 天确认最早一天已清理。旧无日期日志不自动删除，
+   次日确认新的日期文件；第 8 天确认最早一天已清理。旧无日期日志不自动删除，
    验证迁移成功后按需要手动归档。不要修改系统时间来测试轮转。
 
-迁移失败时脚本会报告备份目录，可能留下已停止的服务或部分更新的文件；按下节恢复，
 不要把脚本成功退出或服务 Running 当作健康检查的替代。
 
-## 回滚
+## 独立目录迁移回滚
 
 在管理员 PowerShell 中，使用迁移输出中的真实路径：
 
