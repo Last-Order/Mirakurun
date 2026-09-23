@@ -8,3 +8,4 @@ Forked from Mirakurun 3.9.0-rc.4.
 
 - Select available tuner randomly to prevent single point of failure.
 - Added a configuration option `spaceMap` for tuners, which allows users to specify different `space` argument value for each channel type.
+- Windows daily log rotation with a default seven-day retention. See [configuration, migration and rollback](doc/Windows-Logging.md).

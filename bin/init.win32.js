@@ -19,13 +19,19 @@ if (process.platform !== "win32") {
     process.exit(1);
 }
 
-const fs = require("fs");
 const path = require("path");
-const spawn = require("child_process").spawn;
+require("dotenv").config();
 
 const proc = require("../processes.json").apps[0];
 const configDir = path.join(process.env.USERPROFILE, ".Mirakurun");
 const dataDir = path.join(process.env.LOCALAPPDATA, "Mirakurun");
+
+require("./daily-logs").installDailyLogs({
+    directory: process.env.MIRAKURUN_LOG_DIR || path.join(dataDir, "logs"),
+    retentionDays: process.env.MIRAKURUN_LOG_RETENTION_DAYS === undefined
+        ? 7 : Number(process.env.MIRAKURUN_LOG_RETENTION_DAYS),
+    mirror: !process.env.USING_WINSER
+});
 
 for (const key in proc.env) {
     setEnv(key, proc.env[key]);
