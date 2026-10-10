@@ -46,6 +46,18 @@ export function responseError(res: express.Response, code: number, reason?: stri
 
 export function responseStreamErrorHandler(res: express.Response, err: NodeJS.ErrnoException): express.Response {
 
+    if (res.destroyed || res.writableEnded) {
+        return res;
+    }
+    if (res.headersSent) {
+        res.destroy(err);
+        return res;
+    }
+
+    if (err.code === "TUNER_STARTUP_FAILED") {
+        return responseError(res, 503, "Tuner Startup Failed");
+    }
+
     if (err.message === "no available tuners") {
         return responseError(res, 503, "Tuner Resource Unavailable");
     }

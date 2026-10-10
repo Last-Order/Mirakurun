@@ -98,6 +98,11 @@ export interface Tuner {
 
     readonly isDisabled?: boolean;
 
+    /** Maximum wait for the first raw TS data, in milliseconds (default: 5000). */
+    readonly startupTimeout?: number;
+    /** Prefer other tuners after a startup failure, in milliseconds (default: 30000). */
+    readonly retryCooldown?: number;
+
     /** allows specify different space for different tuners */
     readonly spaceMap?: Record<common.ChannelType, number>;
 }

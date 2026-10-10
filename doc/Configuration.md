@@ -76,7 +76,23 @@ sudo mirakurun config tuners
   # below are optional
   decoder: cmd # string
   isDisabled: false # boolean
+  startupTimeout: 5000 # integer (ms), wait for the first raw TS data
+  retryCooldown: 30000 # integer (ms), prefer other tuners after a startup failure
 ```
+
+#### startupTimeout and retryCooldown
+
+If no raw TS data arrives within `startupTimeout` (default: 5000 ms), Mirakurun
+stops the tuner process and closes its users, including background EPG gathering.
+HTTP stream requests receive 503 so clients can retry. Receiving TS while waiting
+for the selected program's event to begin does not trigger this timeout.
+Increase `startupTimeout` for tuners or remote servers that need longer to start.
+
+After a startup failure, other tuners are preferred for `retryCooldown` (default:
+30000 ms). If no other usable resource exists, the released tuner can start a new
+process during this period. The failed process is never reused. Receiving the
+first raw TS data clears the failure cooldown. Set `retryCooldown` to 0 to disable
+the preference for other tuners.
 
 #### decoder
 

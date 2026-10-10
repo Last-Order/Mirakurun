@@ -90,10 +90,15 @@ export const get: Operation = (req, res) => {
         priority,
         agent: req.get("User-Agent"),
         url: req.url,
-        disableDecoder
+        disableDecoder,
+        onError: err => {
+            phase = "tuner stream failed";
+            clearTimeout(pendingTimer);
+            api.responseStreamErrorHandler(res, err);
+        }
     }, res)
         .then(tsFilter => {
-            if (requestAborted === true || req.aborted === true) {
+            if (requestAborted === true || req.aborted === true || tsFilter.closed || res.writableEnded || res.destroyed) {
                 phase = "closed before initialization completed";
                 return tsFilter.close();
             }
@@ -140,7 +145,7 @@ get.apiDoc = {
             description: "Not Found"
         },
         503: {
-            description: "Tuner Resource Unavailable"
+            description: "Tuner Resource Unavailable or Tuner Startup Failed"
         },
         default: {
             description: "Unexpected Error"
