@@ -529,6 +529,16 @@ definitions:
         type: string
       isDisabled:
         type: boolean
+      startupTimeout:
+        type: integer
+        minimum: 1
+        default: 5000
+        description: Maximum wait for the first raw TS data in milliseconds.
+      retryCooldown:
+        type: integer
+        minimum: 0
+        default: 30000
+        description: Prefer other tuners after a startup failure for this many milliseconds.
 
   ConfigChannels:
     type: array

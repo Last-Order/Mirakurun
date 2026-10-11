@@ -69,10 +69,11 @@ export const get: Operation = (req, res) => {
         priority: parseInt(req.get("X-Mirakurun-Priority"), 10) || 0,
         agent: req.get("User-Agent"),
         url: req.url,
-        disableDecoder: (<number> <any> req.query.decode === 0)
+        disableDecoder: (<number> <any> req.query.decode === 0),
+        onError: err => api.responseStreamErrorHandler(res, err)
     }, res)
         .then(tsFilter => {
-            if (requestAborted === true || req.aborted === true) {
+            if (requestAborted === true || req.aborted === true || tsFilter.closed || res.writableEnded || res.destroyed) {
                 return tsFilter.close();
             }
 
@@ -102,7 +103,7 @@ get.apiDoc = {
             description: "Not Found"
         },
         503: {
-            description: "Tuner Resource Unavailable"
+            description: "Tuner Resource Unavailable or Tuner Startup Failed"
         },
         default: {
             description: "Unexpected Error"

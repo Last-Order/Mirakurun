@@ -270,6 +270,10 @@ export interface ConfigTunersItem {
     decoder?: string;
     /** `true` to **disable** this tuner. */
     isDisabled?: boolean;
+    /** Maximum wait for the first raw TS data, in milliseconds (default: 5000). */
+    startupTimeout?: number;
+    /** Prefer other tuners after a startup failure, in milliseconds (default: 30000). */
+    retryCooldown?: number;
 }
 
 export type ConfigChannels = ConfigChannelsItem[];

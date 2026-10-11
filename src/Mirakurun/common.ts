@@ -22,6 +22,7 @@ export interface User {
     readonly agent?: string;
     readonly url?: string;
     readonly disableDecoder?: boolean;
+    readonly onError?: (err: NodeJS.ErrnoException) => void;
     readonly streamSetting?: StreamSetting;
     readonly streamInfo?: StreamInfo;
 }

@@ -65,6 +65,7 @@ export default class TunerDevice extends EventEmitter {
     private _noDataTimer: NodeJS.Timeout;
     private _startupFailureRecorded = false;
     private _consecutiveStartupFailureCount = 0;
+    private _retryAfter = 0;
 
     constructor(private _index: number, private _config: config.Tuner) {
         super();
@@ -129,6 +130,14 @@ export default class TunerDevice extends EventEmitter {
 
     get isFault(): boolean {
         return this._isFault;
+    }
+
+    get retryAfter(): number {
+        return this._retryAfter;
+    }
+
+    get isCoolingDown(): boolean {
+        return Date.now() < this._retryAfter;
     }
 
     getPriority(): number {
@@ -219,14 +228,18 @@ export default class TunerDevice extends EventEmitter {
 
     endStream(user: User): void {
 
+        if (this._users.delete(user) === false) {
+            return;
+        }
+
         log.debug("TunerDevice#%d end stream for user `%s` (priority=%d)...", this._index, user.id, user.priority);
 
         user._stream.end();
-        this._users.delete(user);
 
-        if (this._users.size === 0) {
+        if (this._users.size === 0 && this._closing === false) {
+            const proc = this._process;
             setTimeout(() => {
-                if (this._users.size === 0 && this._process) {
+                if (this._users.size === 0 && this._process && this._process === proc) {
                     this._kill(true).catch(log.error);
                 }
             }, 3000);
@@ -317,6 +330,7 @@ export default class TunerDevice extends EventEmitter {
         this._spawnedAt = Date.now();
         this._receivedBytes = 0;
         this._startupFailureRecorded = false;
+        this._exited = false;
 
         if (this._config.dvbDevicePath) {
             const cat = child_process.spawn("cat", [this._config.dvbDevicePath]);
@@ -347,11 +361,20 @@ export default class TunerDevice extends EventEmitter {
             this._stream = this._process.stdout;
         }
 
+        const proc = this._process;
+        const release = () => setTimeout(() => {
+            if (this._process === proc) {
+                this._release();
+            }
+        }, this._config.dvbDevicePath ? 1000 : 100);
+
         this._process.once("exit", () => this._exited = true);
 
         this._process.once("error", (err) => {
 
             log.fatal("TunerDevice#%d process error `%s` (pid=%d)", this._index, err.name, this._process.pid);
+
+            this._failStartup(`process error: ${err.message}`);
 
             ++this._fatalCount;
             if (this._fatalCount >= 3) {
@@ -361,7 +384,7 @@ export default class TunerDevice extends EventEmitter {
                 this._closing = true;
             }
             this._end();
-            setTimeout(this._release.bind(this), this._config.dvbDevicePath ? 1000 : 100);
+            release();
         });
 
         this._process.once("close", (code, signal) => {
@@ -372,7 +395,7 @@ export default class TunerDevice extends EventEmitter {
             );
 
             this._end();
-            setTimeout(this._release.bind(this), this._config.dvbDevicePath ? 1000 : 100);
+            release();
         });
 
         this._process.stderr.on("data", data => {
@@ -381,10 +404,11 @@ export default class TunerDevice extends EventEmitter {
 
         // flowing start
         this._stream.on("data", this._streamOnData.bind(this));
-        const noDataTimeout = 5000;
+        const configuredTimeout = this._config.startupTimeout;
+        const noDataTimeout = Number.isFinite(configuredTimeout) && configuredTimeout > 0 ? configuredTimeout : 5000;
         this._noDataTimer = setTimeout(() => {
-            if (this._process && this._receivedBytes === 0 && this._closing === false) {
-                this._recordStartupFailure(`no data received within ${noDataTimeout}ms`);
+            if (this._process === proc && this._receivedBytes === 0 && this._closing === false) {
+                this._failStartup(`no data received within ${noDataTimeout}ms`);
             }
         }, noDataTimeout);
 
@@ -394,9 +418,14 @@ export default class TunerDevice extends EventEmitter {
 
     private _streamOnData(chunk: Buffer): void {
 
+        if (this._closing === true || chunk.length === 0) {
+            return;
+        }
+
         this._receivedBytes += chunk.length;
         if (this._receivedBytes === chunk.length) {
             clearTimeout(this._noDataTimer);
+            this._retryAfter = 0;
             if (this._consecutiveStartupFailureCount !== 0) {
                 log.info(
                     "TunerDevice#%d recovered after %d consecutive startup failure(s) (pid=%d, elapsedMs=%d, channel=%s/%s)",
@@ -420,7 +449,7 @@ export default class TunerDevice extends EventEmitter {
     private _end(): void {
 
         if (this._closing === false && this._receivedBytes === 0) {
-            this._recordStartupFailure("process ended before first data");
+            this._failStartup("process ended before first data");
         }
 
         this._isAvailable = false;
@@ -446,6 +475,9 @@ export default class TunerDevice extends EventEmitter {
 
         this._startupFailureRecorded = true;
         ++this._consecutiveStartupFailureCount;
+        const configuredCooldown = this._config.retryCooldown;
+        const cooldown = Number.isFinite(configuredCooldown) && configuredCooldown >= 0 ? configuredCooldown : 30000;
+        this._retryAfter = Date.now() + cooldown;
 
         log.warn(
             "TunerDevice#%d startup failure recorded (consecutiveFailures=%d, reason=%s, elapsedMs=%d, pid=%s, channel=%s, users=%d, command=%s)",
@@ -453,6 +485,40 @@ export default class TunerDevice extends EventEmitter {
             this.pid, this._channel ? `${this._channel.type}/${this._channel.channel}` : "-",
             this._users.size, this._command || "-"
         );
+    }
+
+    private _failStartup(reason: string): void {
+
+        if (this._startupFailureRecorded === true || this._receivedBytes !== 0 || this._closing === true) {
+            return;
+        }
+
+        this._recordStartupFailure(reason);
+        this._isAvailable = false;
+        const users = [...this._users];
+        const err: NodeJS.ErrnoException = new Error(util.format("TunerDevice#%d startup failed: %s", this._index, reason));
+        err.code = "TUNER_STARTUP_FAILED";
+
+        // Set the closing state before notifying users, so a retry cannot join this process.
+        if (this._process && this._process.pid && this._exited === false) {
+            this._kill(true).catch(log.error);
+        } else {
+            this._closing = true;
+        }
+
+        log.warn("TunerDevice#%d ending failed startup; prefer other tuners until %s", this._index, new Date(this._retryAfter).toISOString());
+        for (const user of users) {
+            try {
+                if (user.onError) {
+                    user.onError(err);
+                }
+            } catch (error) {
+                log.error(error);
+            } finally {
+                user._stream.end();
+            }
+        }
+        this._updated();
     }
 
     private async _kill(close: boolean): Promise<void> {
@@ -470,6 +536,7 @@ export default class TunerDevice extends EventEmitter {
         this._closing = close;
 
         const startedAt = Date.now();
+        const proc = this._process;
         const pid = this._process.pid;
         const slowTimer = setTimeout(() => {
             log.warn(
@@ -493,21 +560,21 @@ export default class TunerDevice extends EventEmitter {
             this.once("release", resolve);
 
             if (process.platform === "win32") {
-                const timer = setTimeout(() => this._process.kill(), 3000);
-                this._process.once("exit", () => clearTimeout(timer));
+                const timer = setTimeout(() => proc.kill(), 3000);
+                proc.once("exit", () => clearTimeout(timer));
 
-                this._process.stdin.write("\n");
+                proc.stdin.write("\n");
             } else if (/^dvbv5-zap /.test(this._command) === true) {
-                this._process.kill("SIGKILL");
+                proc.kill("SIGKILL");
             } else {
                 const timer = setTimeout(() => {
                     log.warn("TunerDevice#%d will force killed because SIGTERM timed out...", this._index);
-                    this._process.kill("SIGKILL");
+                    proc.kill("SIGKILL");
                 }, 6000);
-                this._process.once("exit", () => clearTimeout(timer));
+                proc.once("exit", () => clearTimeout(timer));
 
                 // regular way
-                this._process.kill("SIGTERM");
+                proc.kill("SIGTERM");
             }
         });
 

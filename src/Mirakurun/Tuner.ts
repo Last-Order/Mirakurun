@@ -110,6 +110,7 @@ export default class Tuner {
     async getEPG(channel: ChannelItem, time?: number): Promise<void> {
 
         let timeout: NodeJS.Timer;
+        let streamError: NodeJS.ErrnoException;
         if (!time) {
             time = _.config.server.epgRetrievalTime || 1000 * 60 * 10;
         }
@@ -127,6 +128,7 @@ export default class Tuner {
             id: "Mirakurun:getEPG()",
             priority: -1,
             disableDecoder: true,
+            onError: err => streamError = err,
             streamSetting: {
                 channel,
                 networkId,
@@ -137,8 +139,14 @@ export default class Tuner {
         if (tsFilter === null) {
             return;
         }
+        if (tsFilter.closed) {
+            if (streamError) {
+                throw streamError;
+            }
+            return;
+        }
 
-        return new Promise<void>((resolve) => {
+        return new Promise<void>((resolve, reject) => {
             const fin = () => {
                 clearTimeout(timeout);
                 tsFilter.close();
@@ -147,23 +155,32 @@ export default class Tuner {
             tsFilter.once("epgReady", fin);
             tsFilter.once("close", () => {
                 fin();
-                resolve();
+                if (streamError) {
+                    reject(streamError);
+                } else {
+                    resolve();
+                }
             });
         });
     }
 
     async getServices(channel: ChannelItem): Promise<db.Service[]> {
 
+        let streamError: NodeJS.ErrnoException;
         const tsFilter = await this._initTS({
             id: "Mirakurun:getServices()",
             priority: -1,
             disableDecoder: true,
+            onError: err => streamError = err,
             streamSetting: {
                 channel,
                 parseNIT: true,
                 parseSDT: true
             }
         });
+        if (tsFilter.closed) {
+            throw streamError || new Error("stream has closed before get network");
+        }
         return new Promise<db.Service[]>((resolve, reject) => {
 
             let network = {
@@ -173,7 +190,7 @@ export default class Tuner {
             };
             let services: db.Service[] = null;
 
-            setTimeout(() => tsFilter.close(), 20000);
+            const timeout = setTimeout(() => tsFilter.close(), 20000);
 
             Promise.all<void>([
                 new Promise((resolve, reject) => {
@@ -192,10 +209,13 @@ export default class Tuner {
 
             tsFilter.once("close", () => {
 
+                clearTimeout(timeout);
                 tsFilter.removeAllListeners("network");
                 tsFilter.removeAllListeners("services");
 
-                if (network.networkId === -1) {
+                if (streamError) {
+                    reject(streamError);
+                } else if (network.networkId === -1) {
                     reject(new Error("stream has closed before get network"));
                 } else if (services === null) {
                     reject(new Error("stream has closed before get services"));
@@ -296,6 +316,7 @@ export default class Tuner {
                 isFree: device.isFree,
                 isUsing: device.isUsing,
                 isFault: device.isFault,
+                retryAfter: device.retryAfter,
                 priority: device.getPriority(),
                 users: device.users.map(deviceUser => deviceUser.id)
             })));
@@ -325,17 +346,18 @@ export default class Tuner {
             );
 
             let tryCount = 50;
-            const length = devices.length;
 
             function find() {
 
                 let device: TunerDevice = null;
                 let selectionReason: string = null;
+                const candidates = devices.filter(candidate => candidate.isCoolingDown === false);
+                const candidateCount = candidates.length;
 
                 // 1. join to existing
-                for (let i = 0; i < length; i++) {
-                    if (devices[i].isAvailable === true && devices[i].channel === setting.channel) {
-                        device = devices[i];
+                for (let i = 0; i < candidateCount; i++) {
+                    if (candidates[i].isAvailable === true && candidates[i].channel === setting.channel) {
+                        device = candidates[i];
                         selectionReason = "join-existing";
                         break;
                     }
@@ -366,9 +388,9 @@ export default class Tuner {
 
                 // 2. start as new
                 if (device === null) {
-                    for (let i = 0; i < length; i++) {
-                        if (devices[i].isFree === true) {
-                            device = devices[i];
+                    for (let i = 0; i < candidateCount; i++) {
+                        if (candidates[i].isFree === true) {
+                            device = candidates[i];
                             selectionReason = "free";
                             break;
                         }
@@ -377,9 +399,9 @@ export default class Tuner {
 
                 // 3. replace existing
                 if (device === null) {
-                    for (let i = 0; i < length; i++) {
-                        if (devices[i].isAvailable === true && devices[i].users.length === 0) {
-                            device = devices[i];
+                    for (let i = 0; i < candidateCount; i++) {
+                        if (candidates[i].isAvailable === true && candidates[i].users.length === 0) {
+                            device = candidates[i];
                             selectionReason = "replace-idle";
                             break;
                         }
@@ -388,16 +410,27 @@ export default class Tuner {
 
                 // 4. takeover existing
                 if (device === null) {
-                    devices.sort((t1, t2) => {
+                    candidates.sort((t1, t2) => {
                         return t1.getPriority() - t2.getPriority();
                     });
 
-                    for (let i = 0; i < length; i++) {
-                        if (devices[i].isUsing === true && devices[i].getPriority() < user.priority) {
-                            device = devices[i];
+                    for (let i = 0; i < candidateCount; i++) {
+                        if (candidates[i].isUsing === true && candidates[i].getPriority() < user.priority) {
+                            device = candidates[i];
                             selectionReason = "priority-takeover";
                             break;
                         }
+                    }
+                }
+
+                // A released tuner may be retried if no other usable resource exists.
+                // Never reuse its failed process or interrupt an active recording here.
+                if (device === null) {
+                    const fallback = devices.filter(candidate => candidate.isCoolingDown && candidate.isFree)
+                        .sort((t1, t2) => t1.retryAfter - t2.retryAfter)[0];
+                    if (fallback) {
+                        device = fallback;
+                        selectionReason = "retry-after-failure";
                     }
                 }
 
@@ -453,8 +486,16 @@ export default class Tuner {
                             resolveRequest(tsFilter);
                         })
                         .catch((err) => {
-                            tsFilter.end();
-                            rejectRequest(err);
+                            try {
+                                if (user.onError) {
+                                    user.onError(err);
+                                }
+                            } catch (error) {
+                                log.error(error);
+                            } finally {
+                                tsFilter.end();
+                                rejectRequest(err);
+                            }
                         });
                 }
             }
