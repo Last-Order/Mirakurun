@@ -2,7 +2,7 @@
   "name": "@erii/mirakurun",
   "preferGlobal": true,
   "description": "DVR Tuner Server for Japanese TV.",
-  "version": "3.9.0-erii.7",
+  "version": "3.9.0-erii.8",
   "homepage": "https://github.com/Chinachu/Mirakurun",
   "keywords": [
     "mirakurun",
