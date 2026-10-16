@@ -90,8 +90,16 @@ if (process.platform === "linux" || process.platform === "darwin") {
         ]
     });
 } else if (process.platform === "win32") {
+    // Run the JavaScript entry point: Node cannot spawn .cmd files without a shell.
+    // PATH also covers globally installed winser when Mirakurun is linked to a checkout.
+    const winserPath = require.resolve("winser/bin/winser", {
+        paths: [__dirname, ...(process.env.PATH || "").split(path.delimiter)]
+    });
+
     // winser check
-    const winserVersion = child_process.execSync("winser -v", { encoding: "utf8" }).replace(/^[a-z]+ /, "").trim();
+    const winserVersion = child_process.execFileSync(process.execPath, [winserPath, "-v"], {
+        encoding: "utf8"
+    }).replace(/^[a-z]+ /, "").trim();
     const winserExpected = ">=1.0.3 <2.0.0";
     if (semver.satisfies(winserVersion, winserExpected) === true) {
         console.log("Version:", `winser@${winserVersion}`, "[OK]");
@@ -110,8 +118,9 @@ if (process.platform === "linux" || process.platform === "darwin") {
     const stderrLogPath = path.join(dataDir, "stderr");
 
     child_process.execFileSync(
-        "winser.cmd",
+        process.execPath,
         [
+            winserPath,
             "-i", "-a", "--startuptype", "auto",
             "-n", "mirakurun",
             "--startcmd", `node.exe bin\\init.win32.js`,
